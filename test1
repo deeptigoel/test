@@ -1,0 +1,190 @@
+
+
+```python
+from types import SimpleNamespace
+
+from mlflow_utils import get_incumbent_champion
+
+
+def test_get_incumbent_champion_success(mock_client):
+    """
+    Verify that the current Champion is returned correctly
+    when a Champion model with a composite score exists.
+    """
+
+    champion = SimpleNamespace(
+        name="test_model",
+        version="2",
+        tags={
+            "promotion_role": "Champion",
+            "composite_score": "0.85",
+        },
+    )
+
+    mock_client.search_model_versions.return_value = [champion]
+
+    result = get_incumbent_champion(
+        client=mock_client,
+        registered_name="test_model",
+    )
+
+    assert result == {
+        "model_name": "test_model",
+        "version": "2",
+        "composite_score": 0.85,
+    }
+
+    mock_client.search_model_versions.assert_called_once_with(
+        "name = 'test_model'"
+    )
+
+
+def test_get_incumbent_champion_no_champion(mock_client):
+    """
+    Verify that None is returned when no model has the
+    promotion_role tag set to Champion.
+    """
+
+    version = SimpleNamespace(
+        name="test_model",
+        version="1",
+        tags={
+            "promotion_role": "Challenger",
+            "composite_score": "0.70",
+        },
+    )
+
+    mock_client.search_model_versions.return_value = [version]
+
+    result = get_incumbent_champion(
+        client=mock_client,
+        registered_name="test_model",
+    )
+
+    assert result is None
+
+
+def test_get_incumbent_champion_multiple_champions(mock_client):
+    """
+    Verify that the latest model version is selected when
+    multiple Champion versions exist.
+    """
+
+    champion_v1 = SimpleNamespace(
+        name="test_model",
+        version="1",
+        tags={
+            "promotion_role": "Champion",
+            "composite_score": "0.80",
+        },
+    )
+
+    champion_v2 = SimpleNamespace(
+        name="test_model",
+        version="2",
+        tags={
+            "promotion_role": "Champion",
+            "composite_score": "0.85",
+        },
+    )
+
+    champion_v3 = SimpleNamespace(
+        name="test_model",
+        version="3",
+        tags={
+            "promotion_role": "Champion",
+            "composite_score": "0.90",
+        },
+    )
+
+    mock_client.search_model_versions.return_value = [
+        champion_v1,
+        champion_v3,
+        champion_v2,
+    ]
+
+    result = get_incumbent_champion(
+        client=mock_client,
+        registered_name="test_model",
+    )
+
+    assert result == {
+        "model_name": "test_model",
+        "version": "3",
+        "composite_score": 0.90,
+    }
+
+
+def test_get_incumbent_champion_missing_composite_score(mock_client):
+    """
+    Verify that None is returned when the Champion does not
+    have a composite_score tag.
+    """
+
+    champion = SimpleNamespace(
+        name="test_model",
+        version="2",
+        tags={
+            "promotion_role": "Champion",
+        },
+    )
+
+    mock_client.search_model_versions.return_value = [champion]
+
+    result = get_incumbent_champion(
+        client=mock_client,
+        registered_name="test_model",
+    )
+
+    assert result is None
+```
+
+
+
+| Test                      | Why needed                   | What it verifies                         |
+| ------------------------- | ---------------------------- | ---------------------------------------- |
+| `success`                 | Main/normal scenario         | Correct Champion information is returned |
+| `no_champion`             | Handles absence of incumbent | Returns `None` when no Champion exists   |
+| `multiple_champions`      | Tests your `max()` logic     | Highest/latest version is selected       |
+| `missing_composite_score` | Handles incomplete metadata  | Returns `None` when score is unavailable |
+
+### Important
+
+
+
+You simply receive it:
+
+```python
+def test_get_incumbent_champion_success(mock_client):
+```
+
+and configure what the mocked client should return:
+
+```python
+mock_client.search_model_versions.return_value = [champion]
+```
+
+Why I used SimpleNamespace
+
+You could use MagicMock() for the individual versions too, but SimpleNamespace makes the test easier to understand.
+
+Your production code expects each version to have:
+
+version.name
+version.version
+version.tags
+
+So we create a very simple fake object:
+
+champion = SimpleNamespace(
+    name="test_model",
+    version="2",
+    tags={
+        "promotion_role": "Champion",
+        "composite_score": "0.85",
+    },
+)
+
+Think of it as:
+
+One additional test for **invalid `composite_score`** (e.g. `"abc"`) is optional. Your current function would raise `ValueError` in that situation, so test it only if that behavior is something you want to explicitly enforce.
