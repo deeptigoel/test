@@ -1,190 +1,452 @@
-
-
 ```python
-from types import SimpleNamespace
+import pandas as pd
+import pytest
 
-from mlflow_utils import get_incumbent_champion
+from summary import promotion_utils
 
 
-def test_get_incumbent_champion_success(mock_client):
-    """
-    Verify that the current Champion is returned correctly
-    when a Champion model with a composite score exists.
-    """
+# ============================================================
+# calculate_composite_score
+# ============================================================
 
-    champion = SimpleNamespace(
-        name="test_model",
-        version="2",
-        tags={
-            "promotion_role": "Champion",
-            "composite_score": "0.85",
+def test_calculate_composite_score():
+    """Verify weighted composite score is calculated correctly."""
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2"],
+        "factual_consistency": [0.80, 0.70],
+        "bert_f1": [0.90, 0.80],
+        "rougeL": [0.70, 0.60],
+        "meteor": [0.60, 0.50],
+    })
+
+    result = promotion_utils.calculate_composite_score(eval_df)
+
+    assert "composite_score" in result.columns
+    assert result.loc[0, "composite_score"] == pytest.approx(0.78)
+    assert result.loc[1, "composite_score"] == pytest.approx(0.68)
+
+
+def test_calculate_composite_score_empty_dataframe():
+    """Verify an empty dataframe is returned unchanged."""
+
+    eval_df = pd.DataFrame()
+
+    result = promotion_utils.calculate_composite_score(eval_df)
+
+    assert result.empty
+    assert result is not eval_df
+
+
+def test_calculate_composite_score_missing_column():
+    """Verify missing composite inputs raise ValueError."""
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1"],
+        "bert_f1": [0.90],
+        "rougeL": [0.70],
+    })
+
+    with pytest.raises(
+        ValueError,
+        match="Missing composite score inputs",
+    ):
+        promotion_utils.calculate_composite_score(eval_df)
+
+
+def test_calculate_composite_score_invalid_weights(monkeypatch):
+    """Verify weights must sum to one."""
+
+    monkeypatch.setattr(
+        promotion_utils,
+        "_COMPOSITE_INPUTS",
+        {
+            "bert_f1": 0.30,
+            "rougeL": 0.20,
         },
     )
 
-    mock_client.search_model_versions.return_value = [champion]
+    eval_df = pd.DataFrame({
+        "bert_f1": [0.90],
+        "rougeL": [0.70],
+    })
 
-    result = get_incumbent_champion(
-        client=mock_client,
-        registered_name="test_model",
-    )
-
-    assert result == {
-        "model_name": "test_model",
-        "version": "2",
-        "composite_score": 0.85,
-    }
-
-    mock_client.search_model_versions.assert_called_once_with(
-        "name = 'test_model'"
-    )
+    with pytest.raises(
+        ValueError,
+        match="weights must sum to 1.0",
+    ):
+        promotion_utils.calculate_composite_score(eval_df)
 
 
-def test_get_incumbent_champion_no_champion(mock_client):
-    """
-    Verify that None is returned when no model has the
-    promotion_role tag set to Champion.
-    """
+# ============================================================
+# _rank_models
+# ============================================================
 
-    version = SimpleNamespace(
-        name="test_model",
-        version="1",
-        tags={
-            "promotion_role": "Challenger",
-            "composite_score": "0.70",
-        },
-    )
+def test_rank_models():
+    """Verify models are ranked by composite score descending."""
 
-    mock_client.search_model_versions.return_value = [version]
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2", "model_3"],
+        "composite_score": [0.70, 0.90, 0.80],
+    })
 
-    result = get_incumbent_champion(
-        client=mock_client,
-        registered_name="test_model",
-    )
+    result = promotion_utils._rank_models(eval_df)
+
+    assert result["model_name"].tolist() == [
+        "model_2",
+        "model_3",
+        "model_1",
+    ]
+
+    assert result["rank"].tolist() == [1, 2, 3]
+
+
+# ============================================================
+# _select_champion
+# ============================================================
+
+def test_select_champion():
+    """Verify the highest-ranked model is selected as Champion."""
+
+    ranked_df = pd.DataFrame({
+        "model_name": ["model_2", "model_1"],
+        "composite_score": [0.90, 0.80],
+        "rank": [1, 2],
+    })
+
+    result = promotion_utils._select_champion(ranked_df)
+
+    assert result["model_name"] == "model_2"
+    assert result["composite_score"] == 0.90
+
+
+def test_select_champion_empty():
+    """Verify no Champion is returned for an empty dataframe."""
+
+    ranked_df = pd.DataFrame()
+
+    result = promotion_utils._select_champion(ranked_df)
 
     assert result is None
 
 
-def test_get_incumbent_champion_multiple_champions(mock_client):
-    """
-    Verify that the latest model version is selected when
-    multiple Champion versions exist.
-    """
+# ============================================================
+# _select_challenger
+# ============================================================
 
-    champion_v1 = SimpleNamespace(
-        name="test_model",
-        version="1",
-        tags={
-            "promotion_role": "Champion",
-            "composite_score": "0.80",
-        },
-    )
+def test_select_challenger():
+    """Verify the second-ranked model is selected as Challenger."""
 
-    champion_v2 = SimpleNamespace(
-        name="test_model",
-        version="2",
-        tags={
-            "promotion_role": "Champion",
-            "composite_score": "0.85",
-        },
-    )
+    ranked_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2"],
+        "composite_score": [0.90, 0.80],
+        "rank": [1, 2],
+    })
 
-    champion_v3 = SimpleNamespace(
-        name="test_model",
-        version="3",
-        tags={
-            "promotion_role": "Champion",
-            "composite_score": "0.90",
-        },
-    )
+    result = promotion_utils._select_challenger(ranked_df)
 
-    mock_client.search_model_versions.return_value = [
-        champion_v1,
-        champion_v3,
-        champion_v2,
-    ]
+    assert result["model_name"] == "model_2"
+    assert result["composite_score"] == 0.80
 
-    result = get_incumbent_champion(
-        client=mock_client,
-        registered_name="test_model",
-    )
 
-    assert result == {
-        "model_name": "test_model",
-        "version": "3",
+def test_select_challenger_when_only_one_model():
+    """Verify no Challenger is returned when only one model exists."""
+
+    ranked_df = pd.DataFrame({
+        "model_name": ["model_1"],
+        "composite_score": [0.90],
+        "rank": [1],
+    })
+
+    result = promotion_utils._select_challenger(ranked_df)
+
+    assert result is None
+
+
+# ============================================================
+# _prepare_alias_mapping
+# ============================================================
+
+def test_prepare_alias_mapping():
+    """Verify Champion and Challenger aliases are created."""
+
+    champion = {
+        "model_name": "model_1",
         "composite_score": 0.90,
     }
 
+    challenger = {
+        "model_name": "model_2",
+        "composite_score": 0.80,
+    }
 
-def test_get_incumbent_champion_missing_composite_score(mock_client):
-    """
-    Verify that None is returned when the Champion does not
-    have a composite_score tag.
-    """
-
-    champion = SimpleNamespace(
-        name="test_model",
-        version="2",
-        tags={
-            "promotion_role": "Champion",
-        },
+    result = promotion_utils._prepare_alias_mapping(
+        champion,
+        challenger,
     )
 
-    mock_client.search_model_versions.return_value = [champion]
+    assert result == {
+        "model_1": "Champion",
+        "model_2": "Challenger",
+    }
 
-    result = get_incumbent_champion(
-        client=mock_client,
-        registered_name="test_model",
+
+def test_prepare_alias_mapping_without_challenger():
+    """Verify only Champion alias is created when Challenger is absent."""
+
+    champion = {
+        "model_name": "model_1",
+        "composite_score": 0.90,
+    }
+
+    result = promotion_utils._prepare_alias_mapping(
+        champion,
+        None,
     )
 
-    assert result is None
+    assert result == {
+        "model_1": "Champion",
+    }
+
+
+# ============================================================
+# _clears_promotion_floor
+# ============================================================
+
+def test_clears_promotion_floor():
+    """Verify a model meeting the promotion floor passes."""
+
+    candidate = {
+        "model_name": "model_1",
+        "composite_score": 0.60,
+    }
+
+    assert promotion_utils._clears_promotion_floor(candidate)
+
+
+def test_does_not_clear_promotion_floor():
+    """Verify a model below the promotion floor fails."""
+
+    candidate = {
+        "model_name": "model_1",
+        "composite_score": 0.40,
+    }
+
+    assert not promotion_utils._clears_promotion_floor(candidate)
+
+
+def test_clears_promotion_floor_with_none():
+    """Verify None candidate does not pass the promotion floor."""
+
+    assert not promotion_utils._clears_promotion_floor(None)
+
+
+# ============================================================
+# _beats_incumbent
+# ============================================================
+
+def test_beats_incumbent_when_no_incumbent():
+    """Verify a candidate passes when no incumbent exists."""
+
+    candidate = {
+        "model_name": "model_1",
+        "composite_score": 0.70,
+    }
+
+    assert promotion_utils._beats_incumbent(
+        candidate,
+        None,
+    )
+
+
+def test_beats_incumbent():
+    """Verify candidate beats the incumbent when score is sufficient."""
+
+    candidate = {
+        "model_name": "model_1",
+        "composite_score": 0.80,
+    }
+
+    assert promotion_utils._beats_incumbent(
+        candidate,
+        0.70,
+    )
+
+
+def test_does_not_beat_incumbent():
+    """Verify candidate does not replace a better incumbent."""
+
+    candidate = {
+        "model_name": "model_1",
+        "composite_score": 0.70,
+    }
+
+    assert not promotion_utils._beats_incumbent(
+        candidate,
+        0.80,
+    )
+
+
+def test_beats_incumbent_with_none_candidate():
+    """Verify None candidate cannot beat an incumbent."""
+
+    assert not promotion_utils._beats_incumbent(
+        None,
+        0.70,
+    )
+
+
+# ============================================================
+# promote_models
+# ============================================================
+
+def test_promote_models_success(monkeypatch):
+    """Verify Champion and Challenger are promoted successfully."""
+
+    monkeypatch.setattr(
+        promotion_utils,
+        "logger",
+        __import__("logging").getLogger(__name__),
+    )
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2"],
+        "composite_score": [0.90, 0.80],
+    })
+
+    result = promotion_utils.promote_models(eval_df)
+
+    assert result["promotion_status"] == "completed"
+
+    assert result["champion"]["model_name"] == "model_1"
+    assert result["challenger"]["model_name"] == "model_2"
+
+    assert result["champion_score"] == 0.90
+    assert result["challenger_score"] == 0.80
+
+    assert result["aliases"] == {
+        "model_1": "Champion",
+        "model_2": "Challenger",
+    }
+
+    assert result["promotion_blocked_reason"] is None
+
+
+def test_promote_models_empty_dataframe():
+    """Verify promotion fails when no evaluation results exist."""
+
+    eval_df = pd.DataFrame()
+
+    with pytest.raises(
+        ValueError,
+        match="No evaluation results available",
+    ):
+        promotion_utils.promote_models(eval_df)
+
+
+def test_promote_models_blocked_below_floor(monkeypatch):
+    """Verify promotion is blocked when Champion is below the floor."""
+
+    monkeypatch.setattr(
+        promotion_utils,
+        "logger",
+        __import__("logging").getLogger(__name__),
+    )
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2"],
+        "composite_score": [0.40, 0.30],
+    })
+
+    result = promotion_utils.promote_models(eval_df)
+
+    assert result["promotion_status"] == "blocked"
+    assert result["champion"] is None
+    assert result["challenger"] is None
+    assert result["aliases"] == {}
+    assert "below the MIN_COMPOSITE_SCORE" in (
+        result["promotion_blocked_reason"]
+    )
+
+
+def test_promote_models_blocked_by_incumbent(monkeypatch):
+    """Verify promotion is blocked when candidate cannot beat incumbent."""
+
+    monkeypatch.setattr(
+        promotion_utils,
+        "logger",
+        __import__("logging").getLogger(__name__),
+    )
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2"],
+        "composite_score": [0.70, 0.60],
+    })
+
+    result = promotion_utils.promote_models(
+        eval_df,
+        incumbent_champion_score=0.80,
+    )
+
+    assert result["promotion_status"] == "blocked"
+    assert result["champion"] is None
+    assert result["challenger"] is None
+    assert result["aliases"] == {}
+    assert "does not beat the incumbent Champion" in (
+        result["promotion_blocked_reason"]
+    )
+
+
+def test_promote_models_challenger_below_floor(monkeypatch):
+    """Verify Challenger alias is omitted when Challenger is below floor."""
+
+    monkeypatch.setattr(
+        promotion_utils,
+        "logger",
+        __import__("logging").getLogger(__name__),
+    )
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1", "model_2"],
+        "composite_score": [0.80, 0.40],
+    })
+
+    result = promotion_utils.promote_models(eval_df)
+
+    assert result["promotion_status"] == "completed"
+
+    assert result["champion"]["model_name"] == "model_1"
+    assert result["challenger"] is None
+
+    assert result["champion_score"] == 0.80
+    assert result["challenger_score"] is None
+
+    assert result["aliases"] == {
+        "model_1": "Champion",
+    }
+
+
+def test_promote_models_single_model(monkeypatch):
+    """Verify a single qualifying model becomes Champion only."""
+
+    monkeypatch.setattr(
+        promotion_utils,
+        "logger",
+        __import__("logging").getLogger(__name__),
+    )
+
+    eval_df = pd.DataFrame({
+        "model_name": ["model_1"],
+        "composite_score": [0.80],
+    })
+
+    result = promotion_utils.promote_models(eval_df)
+
+    assert result["promotion_status"] == "completed"
+    assert result["champion"]["model_name"] == "model_1"
+    assert result["challenger"] is None
+
+    assert result["aliases"] == {
+        "model_1": "Champion",
+    }
 ```
-
-
-
-| Test                      | Why needed                   | What it verifies                         |
-| ------------------------- | ---------------------------- | ---------------------------------------- |
-| `success`                 | Main/normal scenario         | Correct Champion information is returned |
-| `no_champion`             | Handles absence of incumbent | Returns `None` when no Champion exists   |
-| `multiple_champions`      | Tests your `max()` logic     | Highest/latest version is selected       |
-| `missing_composite_score` | Handles incomplete metadata  | Returns `None` when score is unavailable |
-
-### Important
-
-
-
-You simply receive it:
-
-```python
-def test_get_incumbent_champion_success(mock_client):
-```
-
-and configure what the mocked client should return:
-
-```python
-mock_client.search_model_versions.return_value = [champion]
-```
-
-Why I used SimpleNamespace
-
-You could use MagicMock() for the individual versions too, but SimpleNamespace makes the test easier to understand.
-
-Your production code expects each version to have:
-
-version.name
-version.version
-version.tags
-
-So we create a very simple fake object:
-
-champion = SimpleNamespace(
-    name="test_model",
-    version="2",
-    tags={
-        "promotion_role": "Champion",
-        "composite_score": "0.85",
-    },
-)
-
-Think of it as:
-
-One additional test for **invalid `composite_score`** (e.g. `"abc"`) is optional. Your current function would raise `ValueError` in that situation, so test it only if that behavior is something you want to explicitly enforce.
