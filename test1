@@ -1,260 +1,191 @@
-Integration Test 1 — Preprocessing → Document Combination
+MLflow integration tests I recommend
 
-Flow:
+I would start with 5 integration tests.
 
-Raw input DataFrame
+1. Run setup → tags → parameters → metrics
+
+Purpose: Verify that a real MLflow run receives all the expected metadata.
+
+setup_experiment()
        ↓
-preprocess_df()
+start_run()
        ↓
-combine_documents()
+set_run_tags()
        ↓
-combined/clean dataset
-
-This verifies that the output of preprocessing is actually compatible with the document-combination logic.
-
-For example:
-
-required columns survive preprocessing
-documents are grouped correctly
-multiple documents for the same entity are combined
-dates/product/TA filtering doesn't break downstream processing
-
-This is a good integration test because you're testing two real modules together.
-
-Integration Test 2 — Prepared Data → Summarizer
-Prepared documents
+log_parameters()
        ↓
-summarizer
+log_metrics()
        ↓
-generated summaries
+verify run metadata
 
-Here I would mock the LLM/API call, but use the real preprocessing/input structure and real summarizer logic.
+This verifies that your MLflow utilities work together.
 
-For example:
+2. Input data → lineage → MLflow run
 
-Input Excel-like DataFrame
+This is particularly important for your project.
+
+load input
+    ↓
+start MLflow run
+    ↓
+set_source_lineage_tags()
+    ↓
+log_input_dataset()
+    ↓
+log_artifact(input.xlsx)
+    ↓
+verify lineage
+
+You want to prove that the MLflow run contains enough information to answer:
+
+Which dataset/file produced this run?
+
+3. Model logging → validation → registration
+
+This is probably your highest-priority MLflow integration test.
+
+MLflow run
+   ↓
+log_transformer_model()
+   ↓
+validate model
+   ↓
+register_model()
+   ↓
+model version created
+   ↓
+model version tags
+
+Verify things such as:
+
+model was logged
+registered model exists
+correct registered name
+correct version
+parent_run_id
+dataset_version
+validation_status
+registration status
+
+This connects functionality you currently test separately.
+
+4. Evaluation → composite score → promotion → MLflow metadata
+
+This should connect your evaluation and promotion_utils with MLflow.
+
+Evaluation results
+       ↓
+add_quality_labels()
+       ↓
+calculate_composite_score()
+       ↓
+promote_models()
+       ↓
+MLflow metrics/tags
+       ↓
+Champion / Challenger
+
+For example, if:
+
+model_1 = 0.90
+model_2 = 0.80
+
+the integration test should verify that the MLflow metadata ultimately reflects:
+
+model_1 → Champion
+model_2 → Challenger
+5. Incumbent Champion → new evaluation → promotion decision
+
+This is especially important because you have:
+
+get_incumbent_champion()
+
+and:
+
+promote_models(
+    eval_df,
+    incumbent_champion_score=...
+)
+
+Integration flow:
+
+Existing MLflow Model
         ↓
-preprocessing
+get_incumbent_champion()
         ↓
-document combination
+existing Champion score
         ↓
-summarizer
+new evaluation
         ↓
-summary DataFrame
-
-This is particularly useful because it checks that the data produced upstream has exactly the structure expected by the summarizer.
-
-Integration Test 3 — Summary → Evaluation
-
-This one is important for your project.
-
-Generated summaries
-       ↓
-evaluation.py
-       ↓
-ROUGE
-BLEU
-METEOR
-BERTScore
-factual consistency
-       ↓
-evaluation DataFrame
-
-You don't necessarily need to call an actual LLM here.
-
-The purpose is to verify:
-
-"Does the output produced by my summarization stage work correctly with my evaluation stage?"
-
-This could catch issues such as:
-
-wrong column names
-missing reference summary
-unexpected nulls
-incorrect DataFrame structure
-metric output not being passed correctly
-empty evaluation data handling
-Integration Test 4 — Evaluation → Composite Score → Promotion
-
-This is another high-value integration test for your codebase.
-
-Evaluation metrics
-       ↓
-promotion_utils
-       ↓
 composite score
-       ↓
-threshold/margin check
-       ↓
+        ↓
+compare against incumbent
+        ↓
 promotion decision
 
-For example, create a realistic evaluation DataFrame:
+Test both:
 
-factual_consistency = 0.85
-bert_f1              = 0.80
-rougeL               = 0.75
-meteor               = 0.70
+Candidate wins
 
-Then verify that the score calculated by the evaluation/promotion flow is correctly consumed by the promotion logic.
+incumbent = 0.70
+candidate = 0.80
+→ new Champion
 
-You could have scenarios such as:
+and
 
-score below minimum → no promotion
-score above minimum → eligible
-new model beats Champion by required margin → promotion
-new model does not beat Champion → retain Champion
+Candidate loses
 
-This is much more valuable as an integration test than testing each mathematical function again.
+incumbent = 0.80
+candidate = 0.70
+→ promotion blocked
+I would NOT make this your first integration test
 
-4. Integration with MLflow
+I wouldn't start with:
 
-You also have an important boundary here:
+test_main()
 
-Pipeline
-   ↓
-MLflow utilities
-   ↓
-experiment/run
-   ↓
-metrics/parameters/tags
-   ↓
-model registration/promotion
+covering the entire mlflow_pipeline.main().
 
-I would probably have one or two integration tests around this.
+Your main() is doing too many things:
 
-For example:
-
-Test A — Pipeline → MLflow logging
-
-Verify that when the pipeline runs:
-
-run is created
-parameters are logged
-metrics are logged
-tags are set
-run ID is propagated correctly
-
-You can still mock the actual MLflow backend if you don't want tests dependent on Databricks.
-
-The integration test is testing your code's interaction between:
-
-mlflow_pipeline.py
-       +
-mlflow_utils.py
-
-rather than testing MLflow itself.
-
-Test B — Promotion flow
-
-Potentially:
-
-evaluation
-     ↓
-composite score
-     ↓
-Champion lookup
-     ↓
-promotion decision
-     ↓
-MLflow model/version update
-
-This is probably one of the most important integration tests in your project because it crosses several modules.
-
-5. What I would NOT do in integration tests
-
-This is important.
-
-You already have unit tests, so don't duplicate things like:
-
-test_calculate_composite_score()
-test_get_weight()
-test_get_incumbent_champion()
-test_register_model()
-
-individually.
-
-Those belong in unit tests.
-
-Instead, integration tests should ask:
-
-"If I connect these components, does the overall interaction work?"
-
-For example:
-
-evaluation.py
-        ↓
-promotion_utils.py
-        ↓
+Input
+ ↓
+filter
+ ↓
+preprocess
+ ↓
+summarize
+ ↓
 MLflow
+ ↓
+register model
+ ↓
+evaluation
+ ↓
+promotion
+ ↓
+model card
 
-That's an integration test.
+That test will become difficult to debug.
 
-6. Then your System Tests would go one level higher
+Instead, build the MLflow integration tests around logical lifecycle boundaries.
 
-Once integration tests are working, I'd move to something like:
-
-                 SYSTEM TEST
-                      │
-                      ▼
-                input.xlsx
-                      │
-                      ▼
-              mlflow_pipeline
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-   preprocessing            document combine
-          │                       │
-          └───────────┬───────────┘
-                      ▼
-                  summarizer
-                      │
-                      ▼
-                 evaluation
-                      │
-                      ▼
-             composite scoring
-                      │
-                      ▼
-                 promotion
-                      │
-                      ▼
-                 final output
-
-A system test would exercise essentially the complete application flow using a controlled test dataset.
-
-For example:
-
-Given a valid input.xlsx containing documents for Product X and TA Y, execute the pipeline and verify that the expected summary output is produced with the expected columns and that the pipeline completes successfully.
-
-You may mock external LLM calls, depending on whether you want deterministic/cheap system tests. That's still a system test if you're exercising the application's complete workflow.
-
-7. I suggest we do this in a very structured way
-
-Send me these five files first:
-
-mlflow_pipeline.py
-summarizer.py
-evaluation.py
-promotion_utils.py
-mlflow_utils.py
-
-And then:
-
-conftest.py
-io_utils.py
-preprocessing utility
-document-combination utility
-
-If they're small, you can send them all together.
-
-Once I see them, I can map your actual architecture and give you something like:
-
-Integration Test Suite
+Your test structure could become
+tests/
 │
-├── test_preprocessing_and_combination
-├── test_combination_and_summarization
-├── test_summarization_and_evaluation
-├── test_evaluation_and_promotion
-├── test_pipeline_and_mlflow
-└── test_end_to_end_promotion_flow
+├── unit/
+│   ├── test_mlflow_utils.py
+│   └── test_promotion_utils.py
+│
+└── integration/
+    ├── test_mlflow_run.py
+    ├── test_mlflow_lineage.py
+    ├── test_mlflow_model_lifecycle.py
+    └── test_mlflow_promotion.py
+My priority order
+Priority	Integration test
+⭐⭐⭐⭐⭐	Model logging → registration → model version metadata
+⭐⭐⭐⭐⭐	Evaluation → composite score → Champion/Challenger → MLflow
+⭐⭐⭐⭐	Existing Champion → new candidate → promotion decision
+⭐⭐⭐⭐	Input → lineage → MLflow run
+⭐⭐⭐	Run → tags → parameters → metrics
