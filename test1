@@ -1,24 +1,147 @@
-est_calculate_composite_score	Verifies the weighted composite score is calculated correctly.
-test_calculate_composite_score_empty_dataframe	Verifies an empty DataFrame is returned unchanged as a copy.
-test_calculate_composite_score_missing_column	Verifies missing required metric columns raise a ValueError.
-test_calculate_composite_score_invalid_weights	Verifies invalid weights that do not sum to 1.0 raise a ValueError.
-test_rank_models	Verifies models are ranked in descending order of composite score.
-test_select_champion	Verifies the highest-ranked model is selected as Champion.
-test_select_champion_empty	Verifies no Champion is returned when the ranked DataFrame is empty.
-test_select_challenger	Verifies the second-ranked model is selected as Challenger.
-test_select_challenger_when_only_one_model	Verifies no Challenger is returned when only one model exists.
-test_prepare_alias_mapping	Verifies Champion and Challenger aliases are created correctly.
-test_prepare_alias_mapping_without_challenger	Verifies only the Champion alias is created when no Challenger exists.
-test_clears_promotion_floor	Verifies a candidate meeting the minimum score passes the promotion floor.
-test_does_not_clear_promotion_floor	Verifies a candidate below the minimum score fails the promotion floor.
-test_clears_promotion_floor_with_none	Verifies a None candidate fails the promotion floor check.
-test_beats_incumbent_when_no_incumbent	Verifies a candidate passes when there is no incumbent Champion.
-test_beats_incumbent	Verifies a candidate with a higher score can beat the incumbent Champion.
-test_does_not_beat_incumbent	Verifies a candidate with a lower score cannot replace the incumbent Champion.
-test_beats_incumbent_with_none_candidate	Verifies a None candidate cannot beat an incumbent.
-test_promote_models_success	Verifies successful promotion assigns Champion and Challenger correctly.
-test_promote_models_empty_dataframe	Verifies promotion raises an error when no evaluation results are available.
-test_promote_models_blocked_below_floor	Verifies promotion is blocked when the top model is below the minimum score floor.
-test_promote_models_blocked_by_incumbent	Verifies promotion is blocked when the candidate cannot beat the incumbent Champion.
-test_promote_models_challenger_below_floor	Verifies a below-floor Challenger is retained with its score but does not receive a Challenger alias.
-test_promote_models_single_model	Verifies a single qualifying model becomes Champion with no Challenger.
+1. Returns champion score	A valid champion with a valid composite_score returns the score
+2. Ignores non-champion	Models with promotion_role != "champion" are skipped
+3. Ignores missing score	Champion without composite_score is skipped
+4. Ignores invalid score	Non-numeric composite_score is skipped
+5. Returns highest champion score	Multiple champions across registered models → highest score is returned
+6. No valid champion	No champion / no valid score → returns None
+7. Duplicate registered names	set(registered_names) ensures the same registered model is searched only once
+
+Assuming your MLflow version objects are mocked, you could write:
+
+def test_get_incumbent_champion_score_returns_champion_score(mock_mlflow_client):
+    version = MagicMock()
+    version.tags = {
+        "promotion_role": "champion",
+        "composite_score": "0.82",
+    }
+
+    mock_mlflow_client.search_model_versions.return_value = [version]
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a"],
+    )
+
+    assert result == 0.82
+def test_get_incumbent_champion_score_ignores_non_champion(
+    mock_mlflow_client,
+):
+    version = MagicMock()
+    version.tags = {
+        "promotion_role": "challenger",
+        "composite_score": "0.90",
+    }
+
+    mock_mlflow_client.search_model_versions.return_value = [version]
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a"],
+    )
+
+    assert result is None
+def test_get_incumbent_champion_score_ignores_missing_score(
+    mock_mlflow_client,
+):
+    version = MagicMock()
+    version.tags = {
+        "promotion_role": "champion",
+    }
+
+    mock_mlflow_client.search_model_versions.return_value = [version]
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a"],
+    )
+
+    assert result is None
+def test_get_incumbent_champion_score_ignores_invalid_score(
+    mock_mlflow_client,
+):
+    version = MagicMock()
+    version.tags = {
+        "promotion_role": "champion",
+        "composite_score": "invalid",
+    }
+
+    mock_mlflow_client.search_model_versions.return_value = [version]
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a"],
+    )
+
+    assert result is None
+def test_get_incumbent_champion_score_returns_highest_score(
+    mock_mlflow_client,
+):
+    version_1 = MagicMock()
+    version_1.tags = {
+        "promotion_role": "champion",
+        "composite_score": "0.72",
+    }
+
+    version_2 = MagicMock()
+    version_2.tags = {
+        "promotion_role": "champion",
+        "composite_score": "0.85",
+    }
+
+    mock_mlflow_client.search_model_versions.return_value = [
+        version_1,
+        version_2,
+    ]
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a"],
+    )
+
+    assert result == 0.85
+def test_get_incumbent_champion_score_returns_none_when_no_models(
+    mock_mlflow_client,
+):
+    mock_mlflow_client.search_model_versions.return_value = []
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a"],
+    )
+
+    assert result is None
+
+And importantly, because your function explicitly uses set(registered_names):
+
+def test_get_incumbent_champion_score_deduplicates_registered_names(
+    mock_mlflow_client,
+):
+    version = MagicMock()
+    version.tags = {
+        "promotion_role": "champion",
+        "composite_score": "0.80",
+    }
+
+    mock_mlflow_client.search_model_versions.return_value = [version]
+
+    result = get_incumbent_champion_score(
+        mock_mlflow_client,
+        ["model_a", "model_a", "model_a"],
+    )
+
+    assert result == 0.80
+    mock_mlflow_client.search_model_versions.assert_called_once_with(
+        "name='model_a'"
+    )
+One important point for your implementation
+
+The highest-score test is particularly important because your function is deliberately doing:
+
+if best is None or score > best:
+    best = score
+
+So the expected behavior is:
+
+multiple champion versions → return the maximum valid champion composite score.
+
+Also, I would not test for challenger score here. This function's responsibility is specifically to retrieve the incumbent champion's score, and returning None when there is no valid champion score is appropriate.
