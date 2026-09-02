@@ -1,470 +1,260 @@
-```python
-import pandas as pd
-import pytest
+Integration Test 1 — Preprocessing → Document Combination
 
-from summary import promotion_utils
+Flow:
 
+Raw input DataFrame
+       ↓
+preprocess_df()
+       ↓
+combine_documents()
+       ↓
+combined/clean dataset
 
-# ============================================================
-# calculate_composite_score
-# ============================================================
+This verifies that the output of preprocessing is actually compatible with the document-combination logic.
 
-def test_calculate_composite_score():
-    """Verify weighted composite score is calculated correctly."""
+For example:
 
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2"],
-        "factual_consistency": [0.80, 0.70],
-        "bert_f1": [0.90, 0.80],
-        "rougeL": [0.70, 0.60],
-        "meteor": [0.60, 0.50],
-    })
+required columns survive preprocessing
+documents are grouped correctly
+multiple documents for the same entity are combined
+dates/product/TA filtering doesn't break downstream processing
 
-    result = promotion_utils.calculate_composite_score(eval_df)
+This is a good integration test because you're testing two real modules together.
 
-    assert "composite_score" in result.columns
-    assert result.loc[0, "composite_score"] == pytest.approx(0.78)
-    assert result.loc[1, "composite_score"] == pytest.approx(0.68)
+Integration Test 2 — Prepared Data → Summarizer
+Prepared documents
+       ↓
+summarizer
+       ↓
+generated summaries
 
+Here I would mock the LLM/API call, but use the real preprocessing/input structure and real summarizer logic.
 
-def test_calculate_composite_score_empty_dataframe():
-    """Verify an empty dataframe is returned unchanged."""
+For example:
 
-    eval_df = pd.DataFrame()
+Input Excel-like DataFrame
+        ↓
+preprocessing
+        ↓
+document combination
+        ↓
+summarizer
+        ↓
+summary DataFrame
 
-    result = promotion_utils.calculate_composite_score(eval_df)
+This is particularly useful because it checks that the data produced upstream has exactly the structure expected by the summarizer.
 
-    assert result.empty
-    assert result is not eval_df
+Integration Test 3 — Summary → Evaluation
 
+This one is important for your project.
 
-def test_calculate_composite_score_missing_column():
-    """Verify missing composite inputs raise ValueError."""
+Generated summaries
+       ↓
+evaluation.py
+       ↓
+ROUGE
+BLEU
+METEOR
+BERTScore
+factual consistency
+       ↓
+evaluation DataFrame
 
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1"],
-        "bert_f1": [0.90],
-        "rougeL": [0.70],
-    })
+You don't necessarily need to call an actual LLM here.
 
-    with pytest.raises(
-        ValueError,
-        match="Missing composite score inputs",
-    ):
-        promotion_utils.calculate_composite_score(eval_df)
+The purpose is to verify:
 
+"Does the output produced by my summarization stage work correctly with my evaluation stage?"
 
-def test_calculate_composite_score_invalid_weights(monkeypatch):
-    """Verify weights must sum to one."""
+This could catch issues such as:
 
-    monkeypatch.setattr(
-        promotion_utils,
-        "_COMPOSITE_INPUTS",
-        {
-            "bert_f1": 0.30,
-            "rougeL": 0.20,
-        },
-    )
+wrong column names
+missing reference summary
+unexpected nulls
+incorrect DataFrame structure
+metric output not being passed correctly
+empty evaluation data handling
+Integration Test 4 — Evaluation → Composite Score → Promotion
 
-    eval_df = pd.DataFrame({
-        "bert_f1": [0.90],
-        "rougeL": [0.70],
-    })
+This is another high-value integration test for your codebase.
 
-    with pytest.raises(
-        ValueError,
-        match="weights must sum to 1.0",
-    ):
-        promotion_utils.calculate_composite_score(eval_df)
+Evaluation metrics
+       ↓
+promotion_utils
+       ↓
+composite score
+       ↓
+threshold/margin check
+       ↓
+promotion decision
 
+For example, create a realistic evaluation DataFrame:
 
-# ============================================================
-# _rank_models
-# ============================================================
+factual_consistency = 0.85
+bert_f1              = 0.80
+rougeL               = 0.75
+meteor               = 0.70
 
-def test_rank_models():
-    """Verify models are ranked by composite score descending."""
+Then verify that the score calculated by the evaluation/promotion flow is correctly consumed by the promotion logic.
 
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2", "model_3"],
-        "composite_score": [0.70, 0.90, 0.80],
-    })
+You could have scenarios such as:
 
-    result = promotion_utils._rank_models(eval_df)
+score below minimum → no promotion
+score above minimum → eligible
+new model beats Champion by required margin → promotion
+new model does not beat Champion → retain Champion
 
-    assert result["model_name"].tolist() == [
-        "model_2",
-        "model_3",
-        "model_1",
-    ]
+This is much more valuable as an integration test than testing each mathematical function again.
 
-    assert result["rank"].tolist() == [1, 2, 3]
+4. Integration with MLflow
 
+You also have an important boundary here:
 
-# ============================================================
-# _select_champion
-# ============================================================
+Pipeline
+   ↓
+MLflow utilities
+   ↓
+experiment/run
+   ↓
+metrics/parameters/tags
+   ↓
+model registration/promotion
 
-def test_select_champion():
-    """Verify the highest-ranked model is selected as Champion."""
+I would probably have one or two integration tests around this.
 
-    ranked_df = pd.DataFrame({
-        "model_name": ["model_2", "model_1"],
-        "composite_score": [0.90, 0.80],
-        "rank": [1, 2],
-    })
+For example:
 
-    result = promotion_utils._select_champion(ranked_df)
+Test A — Pipeline → MLflow logging
 
-    assert result["model_name"] == "model_2"
-    assert result["composite_score"] == 0.90
+Verify that when the pipeline runs:
 
+run is created
+parameters are logged
+metrics are logged
+tags are set
+run ID is propagated correctly
 
-def test_select_champion_empty():
-    """Verify no Champion is returned for an empty dataframe."""
+You can still mock the actual MLflow backend if you don't want tests dependent on Databricks.
 
-    ranked_df = pd.DataFrame()
+The integration test is testing your code's interaction between:
 
-    result = promotion_utils._select_champion(ranked_df)
+mlflow_pipeline.py
+       +
+mlflow_utils.py
 
-    assert result is None
+rather than testing MLflow itself.
 
+Test B — Promotion flow
 
-# ============================================================
-# _select_challenger
-# ============================================================
+Potentially:
 
-def test_select_challenger():
-    """Verify the second-ranked model is selected as Challenger."""
+evaluation
+     ↓
+composite score
+     ↓
+Champion lookup
+     ↓
+promotion decision
+     ↓
+MLflow model/version update
 
-    ranked_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2"],
-        "composite_score": [0.90, 0.80],
-        "rank": [1, 2],
-    })
+This is probably one of the most important integration tests in your project because it crosses several modules.
 
-    result = promotion_utils._select_challenger(ranked_df)
+5. What I would NOT do in integration tests
 
-    assert result["model_name"] == "model_2"
-    assert result["composite_score"] == 0.80
+This is important.
 
+You already have unit tests, so don't duplicate things like:
 
-def test_select_challenger_when_only_one_model():
-    """Verify no Challenger is returned when only one model exists."""
+test_calculate_composite_score()
+test_get_weight()
+test_get_incumbent_champion()
+test_register_model()
 
-    ranked_df = pd.DataFrame({
-        "model_name": ["model_1"],
-        "composite_score": [0.90],
-        "rank": [1],
-    })
+individually.
 
-    result = promotion_utils._select_challenger(ranked_df)
+Those belong in unit tests.
 
-    assert result is None
+Instead, integration tests should ask:
 
+"If I connect these components, does the overall interaction work?"
 
-# ============================================================
-# _prepare_alias_mapping
-# ============================================================
+For example:
 
-def test_prepare_alias_mapping():
-    """Verify Champion and Challenger aliases are created."""
+evaluation.py
+        ↓
+promotion_utils.py
+        ↓
+MLflow
 
-    champion = {
-        "model_name": "model_1",
-        "composite_score": 0.90,
-    }
+That's an integration test.
 
-    challenger = {
-        "model_name": "model_2",
-        "composite_score": 0.80,
-    }
+6. Then your System Tests would go one level higher
 
-    result = promotion_utils._prepare_alias_mapping(
-        champion,
-        challenger,
-    )
+Once integration tests are working, I'd move to something like:
 
-    assert result == {
-        "model_1": "Champion",
-        "model_2": "Challenger",
-    }
+                 SYSTEM TEST
+                      │
+                      ▼
+                input.xlsx
+                      │
+                      ▼
+              mlflow_pipeline
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+   preprocessing            document combine
+          │                       │
+          └───────────┬───────────┘
+                      ▼
+                  summarizer
+                      │
+                      ▼
+                 evaluation
+                      │
+                      ▼
+             composite scoring
+                      │
+                      ▼
+                 promotion
+                      │
+                      ▼
+                 final output
 
+A system test would exercise essentially the complete application flow using a controlled test dataset.
 
-def test_prepare_alias_mapping_without_challenger():
-    """Verify only Champion alias is created when Challenger is absent."""
+For example:
 
-    champion = {
-        "model_name": "model_1",
-        "composite_score": 0.90,
-    }
+Given a valid input.xlsx containing documents for Product X and TA Y, execute the pipeline and verify that the expected summary output is produced with the expected columns and that the pipeline completes successfully.
 
-    result = promotion_utils._prepare_alias_mapping(
-        champion,
-        None,
-    )
+You may mock external LLM calls, depending on whether you want deterministic/cheap system tests. That's still a system test if you're exercising the application's complete workflow.
 
-    assert result == {
-        "model_1": "Champion",
-    }
+7. I suggest we do this in a very structured way
 
+Send me these five files first:
 
-# ============================================================
-# _clears_promotion_floor
-# ============================================================
+mlflow_pipeline.py
+summarizer.py
+evaluation.py
+promotion_utils.py
+mlflow_utils.py
 
-def test_clears_promotion_floor():
-    """Verify a model meeting the promotion floor passes."""
+And then:
 
-    candidate = {
-        "model_name": "model_1",
-        "composite_score": 0.60,
-    }
+conftest.py
+io_utils.py
+preprocessing utility
+document-combination utility
 
-    assert promotion_utils._clears_promotion_floor(candidate)
+If they're small, you can send them all together.
 
+Once I see them, I can map your actual architecture and give you something like:
 
-def test_does_not_clear_promotion_floor():
-    """Verify a model below the promotion floor fails."""
-
-    candidate = {
-        "model_name": "model_1",
-        "composite_score": 0.40,
-    }
-
-    assert not promotion_utils._clears_promotion_floor(candidate)
-
-
-def test_clears_promotion_floor_with_none():
-    """Verify None candidate does not pass the promotion floor."""
-
-    assert not promotion_utils._clears_promotion_floor(None)
-
-
-# ============================================================
-# _beats_incumbent
-# ============================================================
-
-def test_beats_incumbent_when_no_incumbent():
-    """Verify a candidate passes when no incumbent exists."""
-
-    candidate = {
-        "model_name": "model_1",
-        "composite_score": 0.70,
-    }
-
-    assert promotion_utils._beats_incumbent(
-        candidate,
-        None,
-    )
-
-
-def test_beats_incumbent():
-    """Verify candidate beats the incumbent when score is sufficient."""
-
-    candidate = {
-        "model_name": "model_1",
-        "composite_score": 0.80,
-    }
-
-    assert promotion_utils._beats_incumbent(
-        candidate,
-        0.70,
-    )
-
-
-def test_does_not_beat_incumbent():
-    """Verify candidate does not replace a better incumbent."""
-
-    candidate = {
-        "model_name": "model_1",
-        "composite_score": 0.70,
-    }
-
-    assert not promotion_utils._beats_incumbent(
-        candidate,
-        0.80,
-    )
-
-
-def test_beats_incumbent_with_none_candidate():
-    """Verify None candidate cannot beat an incumbent."""
-
-    assert not promotion_utils._beats_incumbent(
-        None,
-        0.70,
-    )
-
-
-# ============================================================
-# promote_models
-# ============================================================
-
-def test_promote_models_success(monkeypatch):
-    """Verify Champion and Challenger are promoted successfully."""
-
-    monkeypatch.setattr(
-        promotion_utils,
-        "logger",
-        __import__("logging").getLogger(__name__),
-    )
-
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2"],
-        "composite_score": [0.90, 0.80],
-    })
-
-    result = promotion_utils.promote_models(eval_df)
-
-    assert result["promotion_status"] == "completed"
-
-    assert result["champion"]["model_name"] == "model_1"
-    assert result["challenger"]["model_name"] == "model_2"
-
-    assert result["champion_score"] == 0.90
-    assert result["challenger_score"] == 0.80
-
-    assert result["aliases"] == {
-        "model_1": "Champion",
-        "model_2": "Challenger",
-    }
-
-    assert result["promotion_blocked_reason"] is None
-
-
-def test_promote_models_empty_dataframe():
-    """Verify promotion fails when no evaluation results exist."""
-
-    eval_df = pd.DataFrame()
-
-    with pytest.raises(
-        ValueError,
-        match="No evaluation results available",
-    ):
-        promotion_utils.promote_models(eval_df)
-
-
-def test_promote_models_blocked_below_floor(monkeypatch):
-    """Verify promotion is blocked when Champion is below the floor."""
-
-    monkeypatch.setattr(
-        promotion_utils,
-        "logger",
-        __import__("logging").getLogger(__name__),
-    )
-
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2"],
-        "composite_score": [0.40, 0.30],
-    })
-
-    result = promotion_utils.promote_models(eval_df)
-
-    assert result["promotion_status"] == "blocked"
-    assert result["champion"] is None
-    assert result["challenger"] is None
-    assert result["aliases"] == {}
-    assert "below the MIN_COMPOSITE_SCORE" in (
-        result["promotion_blocked_reason"]
-    )
-
-
-def test_promote_models_blocked_by_incumbent(monkeypatch):
-    """Verify promotion is blocked when candidate cannot beat incumbent."""
-
-    monkeypatch.setattr(
-        promotion_utils,
-        "logger",
-        __import__("logging").getLogger(__name__),
-    )
-
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2"],
-        "composite_score": [0.70, 0.60],
-    })
-
-    result = promotion_utils.promote_models(
-        eval_df,
-        incumbent_champion_score=0.80,
-    )
-
-    assert result["promotion_status"] == "blocked"
-    assert result["champion"] is None
-    assert result["challenger"] is None
-    assert result["aliases"] == {}
-    assert "does not beat the incumbent Champion" in (
-        result["promotion_blocked_reason"]
-    )
-
-
-def test_promote_models_challenger_below_floor(monkeypatch):
-    """Verify Challenger alias is omitted when Challenger is below floor."""
-
-    monkeypatch.setattr(
-        promotion_utils,
-        "logger",
-        __import__("logging").getLogger(__name__),
-    )
-
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1", "model_2"],
-        "composite_score": [0.80, 0.40],
-    })
-
-    result = promotion_utils.promote_models(eval_df)
-
-    assert result["promotion_status"] == "completed"
-
-    assert result["champion"]["model_name"] == "model_1"
-    assert result["challenger"] is None
-
-    assert result["champion_score"] == 0.80
-    assert result["challenger_score"] is None
-
-    assert result["aliases"] == {
-        "model_1": "Champion",
-    }
-
-
-def test_promote_models_single_model(monkeypatch):
-    """Verify a single qualifying model becomes Champion only."""
-
-    monkeypatch.setattr(
-        promotion_utils,
-        "logger",
-        __import__("logging").getLogger(__name__),
-    )
-
-    eval_df = pd.DataFrame({
-        "model_name": ["model_1"],
-        "composite_score": [0.80],
-    })
-
-    result = promotion_utils.promote_models(eval_df)
-
-    assert result["promotion_status"] == "completed"
-    assert result["champion"]["model_name"] == "model_1"
-    assert result["challenger"] is None
-
-    assert result["aliases"] == {
-        "model_1": "Champion",
-    }
-```
-
-
-total_weight = sum(_COMPOSITE_INPUTS.values())
-
-    if not abs(total_weight - 1.0) < 1e-6:
-        raise ValueError(
-            "Composite score weights must sum to 1.0. "
-            f"Current sum: {total_weight}"
-        )
-
-    result_df = eval_df.copy()
-
-    result_df["composite_score"] = sum(
-        weight * result_df[column]
-        for column, weight in _COMPOSITE_INPUTS.items()
-    )
-
-    return result_df
+Integration Test Suite
+│
+├── test_preprocessing_and_combination
+├── test_combination_and_summarization
+├── test_summarization_and_evaluation
+├── test_evaluation_and_promotion
+├── test_pipeline_and_mlflow
+└── test_end_to_end_promotion_flow
