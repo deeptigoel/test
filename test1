@@ -1,147 +1,33 @@
-1. Returns champion score	A valid champion with a valid composite_score returns the score
-2. Ignores non-champion	Models with promotion_role != "champion" are skipped
-3. Ignores missing score	Champion without composite_score is skipped
-4. Ignores invalid score	Non-numeric composite_score is skipped
-5. Returns highest champion score	Multiple champions across registered models → highest score is returned
-6. No valid champion	No champion / no valid score → returns None
-7. Duplicate registered names	set(registered_names) ensures the same registered model is searched only once
+def test_mlflow_run_logs_metadata(mock_mlflow):
+    """Verify MLflow run metadata is logged."""
 
-Assuming your MLflow version objects are mocked, you could write:
-
-def test_get_incumbent_champion_score_returns_champion_score(mock_mlflow_client):
-    version = MagicMock()
-    version.tags = {
-        "promotion_role": "champion",
-        "composite_score": "0.82",
-    }
-
-    mock_mlflow_client.search_model_versions.return_value = [version]
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a"],
+    from mlflow_utils import (
+        setup_experiment,
+        set_run_tags,
+        log_parameters,
+        log_metrics,
     )
 
-    assert result == 0.82
-def test_get_incumbent_champion_score_ignores_non_champion(
-    mock_mlflow_client,
-):
-    version = MagicMock()
-    version.tags = {
-        "promotion_role": "challenger",
-        "composite_score": "0.90",
-    }
-
-    mock_mlflow_client.search_model_versions.return_value = [version]
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a"],
+    setup_experiment("test_experiment")
+    set_run_tags(
+        run_type="inference",
+        capability="summarization",
+        dataset_version="v1",
     )
+    log_parameters({"model_name": "test_model"})
+    log_metrics({"composite_score": 0.85})
 
-    assert result is None
-def test_get_incumbent_champion_score_ignores_missing_score(
-    mock_mlflow_client,
-):
-    version = MagicMock()
-    version.tags = {
-        "promotion_role": "champion",
-    }
-
-    mock_mlflow_client.search_model_versions.return_value = [version]
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a"],
+    mock_mlflow.set_experiment.assert_called_once_with(
+        "test_experiment"
     )
-
-    assert result is None
-def test_get_incumbent_champion_score_ignores_invalid_score(
-    mock_mlflow_client,
-):
-    version = MagicMock()
-    version.tags = {
-        "promotion_role": "champion",
-        "composite_score": "invalid",
-    }
-
-    mock_mlflow_client.search_model_versions.return_value = [version]
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a"],
-    )
-
-    assert result is None
-def test_get_incumbent_champion_score_returns_highest_score(
-    mock_mlflow_client,
-):
-    version_1 = MagicMock()
-    version_1.tags = {
-        "promotion_role": "champion",
-        "composite_score": "0.72",
-    }
-
-    version_2 = MagicMock()
-    version_2.tags = {
-        "promotion_role": "champion",
-        "composite_score": "0.85",
-    }
-
-    mock_mlflow_client.search_model_versions.return_value = [
-        version_1,
-        version_2,
-    ]
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a"],
-    )
-
-    assert result == 0.85
-def test_get_incumbent_champion_score_returns_none_when_no_models(
-    mock_mlflow_client,
-):
-    mock_mlflow_client.search_model_versions.return_value = []
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a"],
-    )
-
-    assert result is None
-
-And importantly, because your function explicitly uses set(registered_names):
-
-def test_get_incumbent_champion_score_deduplicates_registered_names(
-    mock_mlflow_client,
-):
-    version = MagicMock()
-    version.tags = {
-        "promotion_role": "champion",
-        "composite_score": "0.80",
-    }
-
-    mock_mlflow_client.search_model_versions.return_value = [version]
-
-    result = get_incumbent_champion_score(
-        mock_mlflow_client,
-        ["model_a", "model_a", "model_a"],
-    )
-
-    assert result == 0.80
-    mock_mlflow_client.search_model_versions.assert_called_once_with(
-        "name='model_a'"
-    )
-One important point for your implementation
-
-The highest-score test is particularly important because your function is deliberately doing:
-
-if best is None or score > best:
-    best = score
-
-So the expected behavior is:
-
-multiple champion versions → return the maximum valid champion composite score.
-
-Also, I would not test for challenger score here. This function's responsibility is specifically to retrieve the incumbent champion's score, and returning None when there is no valid champion score is appropriate.
+    mock_mlflow.set_tags.assert_called_once_with({
+        "run_type": "inference",
+        "capability": "summarization",
+        "dataset_version": "v1",
+    })
+    mock_mlflow.log_params.assert_called_once_with({
+        "model_name": "test_model"
+    })
+    mock_mlflow.log_metrics.assert_called_once_with({
+        "composite_score": 0.85
+    })
