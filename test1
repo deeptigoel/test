@@ -1,191 +1,24 @@
-MLflow integration tests I recommend
-
-I would start with 5 integration tests.
-
-1. Run setup → tags → parameters → metrics
-
-Purpose: Verify that a real MLflow run receives all the expected metadata.
-
-setup_experiment()
-       ↓
-start_run()
-       ↓
-set_run_tags()
-       ↓
-log_parameters()
-       ↓
-log_metrics()
-       ↓
-verify run metadata
-
-This verifies that your MLflow utilities work together.
-
-2. Input data → lineage → MLflow run
-
-This is particularly important for your project.
-
-load input
-    ↓
-start MLflow run
-    ↓
-set_source_lineage_tags()
-    ↓
-log_input_dataset()
-    ↓
-log_artifact(input.xlsx)
-    ↓
-verify lineage
-
-You want to prove that the MLflow run contains enough information to answer:
-
-Which dataset/file produced this run?
-
-3. Model logging → validation → registration
-
-This is probably your highest-priority MLflow integration test.
-
-MLflow run
-   ↓
-log_transformer_model()
-   ↓
-validate model
-   ↓
-register_model()
-   ↓
-model version created
-   ↓
-model version tags
-
-Verify things such as:
-
-model was logged
-registered model exists
-correct registered name
-correct version
-parent_run_id
-dataset_version
-validation_status
-registration status
-
-This connects functionality you currently test separately.
-
-4. Evaluation → composite score → promotion → MLflow metadata
-
-This should connect your evaluation and promotion_utils with MLflow.
-
-Evaluation results
-       ↓
-add_quality_labels()
-       ↓
-calculate_composite_score()
-       ↓
-promote_models()
-       ↓
-MLflow metrics/tags
-       ↓
-Champion / Challenger
-
-For example, if:
-
-model_1 = 0.90
-model_2 = 0.80
-
-the integration test should verify that the MLflow metadata ultimately reflects:
-
-model_1 → Champion
-model_2 → Challenger
-5. Incumbent Champion → new evaluation → promotion decision
-
-This is especially important because you have:
-
-get_incumbent_champion()
-
-and:
-
-promote_models(
-    eval_df,
-    incumbent_champion_score=...
-)
-
-Integration flow:
-
-Existing MLflow Model
-        ↓
-get_incumbent_champion()
-        ↓
-existing Champion score
-        ↓
-new evaluation
-        ↓
-composite score
-        ↓
-compare against incumbent
-        ↓
-promotion decision
-
-Test both:
-
-Candidate wins
-
-incumbent = 0.70
-candidate = 0.80
-→ new Champion
-
-and
-
-Candidate loses
-
-incumbent = 0.80
-candidate = 0.70
-→ promotion blocked
-I would NOT make this your first integration test
-
-I wouldn't start with:
-
-test_main()
-
-covering the entire mlflow_pipeline.main().
-
-Your main() is doing too many things:
-
-Input
- ↓
-filter
- ↓
-preprocess
- ↓
-summarize
- ↓
-MLflow
- ↓
-register model
- ↓
-evaluation
- ↓
-promotion
- ↓
-model card
-
-That test will become difficult to debug.
-
-Instead, build the MLflow integration tests around logical lifecycle boundaries.
-
-Your test structure could become
-tests/
-│
-├── unit/
-│   ├── test_mlflow_utils.py
-│   └── test_promotion_utils.py
-│
-└── integration/
-    ├── test_mlflow_run.py
-    ├── test_mlflow_lineage.py
-    ├── test_mlflow_model_lifecycle.py
-    └── test_mlflow_promotion.py
-My priority order
-Priority	Integration test
-⭐⭐⭐⭐⭐	Model logging → registration → model version metadata
-⭐⭐⭐⭐⭐	Evaluation → composite score → Champion/Challenger → MLflow
-⭐⭐⭐⭐	Existing Champion → new candidate → promotion decision
-⭐⭐⭐⭐	Input → lineage → MLflow run
-⭐⭐⭐	Run → tags → parameters → metrics
+est_calculate_composite_score	Verifies the weighted composite score is calculated correctly.
+test_calculate_composite_score_empty_dataframe	Verifies an empty DataFrame is returned unchanged as a copy.
+test_calculate_composite_score_missing_column	Verifies missing required metric columns raise a ValueError.
+test_calculate_composite_score_invalid_weights	Verifies invalid weights that do not sum to 1.0 raise a ValueError.
+test_rank_models	Verifies models are ranked in descending order of composite score.
+test_select_champion	Verifies the highest-ranked model is selected as Champion.
+test_select_champion_empty	Verifies no Champion is returned when the ranked DataFrame is empty.
+test_select_challenger	Verifies the second-ranked model is selected as Challenger.
+test_select_challenger_when_only_one_model	Verifies no Challenger is returned when only one model exists.
+test_prepare_alias_mapping	Verifies Champion and Challenger aliases are created correctly.
+test_prepare_alias_mapping_without_challenger	Verifies only the Champion alias is created when no Challenger exists.
+test_clears_promotion_floor	Verifies a candidate meeting the minimum score passes the promotion floor.
+test_does_not_clear_promotion_floor	Verifies a candidate below the minimum score fails the promotion floor.
+test_clears_promotion_floor_with_none	Verifies a None candidate fails the promotion floor check.
+test_beats_incumbent_when_no_incumbent	Verifies a candidate passes when there is no incumbent Champion.
+test_beats_incumbent	Verifies a candidate with a higher score can beat the incumbent Champion.
+test_does_not_beat_incumbent	Verifies a candidate with a lower score cannot replace the incumbent Champion.
+test_beats_incumbent_with_none_candidate	Verifies a None candidate cannot beat an incumbent.
+test_promote_models_success	Verifies successful promotion assigns Champion and Challenger correctly.
+test_promote_models_empty_dataframe	Verifies promotion raises an error when no evaluation results are available.
+test_promote_models_blocked_below_floor	Verifies promotion is blocked when the top model is below the minimum score floor.
+test_promote_models_blocked_by_incumbent	Verifies promotion is blocked when the candidate cannot beat the incumbent Champion.
+test_promote_models_challenger_below_floor	Verifies a below-floor Challenger is retained with its score but does not receive a Challenger alias.
+test_promote_models_single_model	Verifies a single qualifying model becomes Champion with no Challenger.
