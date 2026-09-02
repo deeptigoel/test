@@ -450,3 +450,21 @@ def test_promote_models_single_model(monkeypatch):
         "model_1": "Champion",
     }
 ```
+
+
+total_weight = sum(_COMPOSITE_INPUTS.values())
+
+    if not abs(total_weight - 1.0) < 1e-6:
+        raise ValueError(
+            "Composite score weights must sum to 1.0. "
+            f"Current sum: {total_weight}"
+        )
+
+    result_df = eval_df.copy()
+
+    result_df["composite_score"] = sum(
+        weight * result_df[column]
+        for column, weight in _COMPOSITE_INPUTS.items()
+    )
+
+    return result_df
