@@ -242,3 +242,867 @@ configure_mlflow(
 That is much cleaner for your MLflow integration testing, because the test becomes completely isolated from your real Databricks/MLflow configuration.
 
 One other thing: your current log_transformer_model() doesn't actually use the signature you're calculating. If schema enforcement is one of the things you specifically want this integration test to verify, we should modify log_transformer_model() to accept and pass the signature to mlflow.transformers.log_model().
+
+
+#######
+
+Evaluation
+
+I would make the evaluation integration test a real end-to-end MLflow test, not a unit test with mocked MLflow calls.
+
+Your production flow is:
+
+registered models → Evaluation child run → evaluate_product → quality labels → composite score → incumbent champion lookup → promotion metadata → MLflow metrics/tags → evaluation artifact → registered model-version tags.
+
+Below is everything I would put in place.
+
+1. What this integration test should verify
+
+The test should verify these real integrations:
+
+Start a real local MLflow server.
+Use your actual configure_mlflow().
+Use a real SQLite MLflow backend: mlflow_summ.db.
+Create a real MLflow parent run.
+Register real model versions.
+Run your actual evaluation functions.
+Calculate the actual composite scores.
+Run the actual get_incumbent_champion_score().
+Run the actual prepare_promotion_metadata().
+Persist evaluation metrics/tags to MLflow.
+Retrieve the evaluation run using MlflowClient.
+Verify metrics/tags were actually persisted.
+Verify evaluation output artifact exists.
+Verify model-version tags contain:
+evaluation_run_id
+promotion_role
+composite_score
+
+Your production code does exactly these model-version updates.
+
+2. conftest.py
+
+I would add a real MLflow server fixture.
+
+import socket
+import subprocess
+import sys
+import time
+
+import mlflow
+import pytest
+import requests
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def mlflow_server(tmp_path):
+    port = _free_port()
+
+    mlflow_db = tmp_path / "mlflow_summ.db"
+    artifact_root = tmp_path / "mlflow_artifacts"
+    artifact_root.mkdir()
+
+    tracking_uri = f"http://127.0.0.1:{port}"
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mlflow",
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--backend-store-uri",
+            f"sqlite:///{mlflow_db}",
+            "--default-artifact-root",
+            str(artifact_root),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    for _ in range(30):
+        try:
+            response = requests.get(
+                f"{tracking_uri}/health",
+                timeout=1,
+            )
+
+            if response.status_code == 200:
+                break
+
+        except requests.RequestException:
+            time.sleep(1)
+
+    else:
+        process.terminate()
+        raise RuntimeError("MLflow server failed to start")
+
+    mlflow.set_tracking_uri(tracking_uri)
+
+    yield {
+        "tracking_uri": tracking_uri,
+        "db_path": mlflow_db,
+        "artifact_root": artifact_root,
+    }
+
+    mlflow.end_run()
+    process.terminate()
+    process.wait(timeout=10)
+
+This gives you:
+
+tmp_path/
+├── mlflow_summ.db
+└── mlflow_artifacts/
+
+Important: mlflow_summ.db stores MLflow metadata/runs/metrics/tags. The actual artifacts are stored under mlflow_artifacts.
+
+3. Configure MLflow using your actual configure_mlflow()
+
+Your actual function requires:
+
+configure_mlflow(
+    use_unity_catalog,
+    uc_catalog,
+    uc_schema,
+    base_experiment_name,
+    product_name,
+    experiment_root_directory,
+)
+
+and when Unity Catalog is disabled, it sets the registry URI and experiment based on the workspace root.
+
+For the integration test, use:
+
+mlflow_config = configure_mlflow(
+    use_unity_catalog=False,
+    uc_catalog=None,
+    uc_schema=None,
+    base_experiment_name="integration_test",
+    product_name="summarization",
+    experiment_root_directory="/tmp",
+)
+
+Because the MLflow server fixture has already set:
+
+mlflow.set_tracking_uri(tracking_uri)
+
+the experiment and registry operate against your real test MLflow server.
+
+4. Evaluation integration test
+
+I would structure the test like this.
+
+import mlflow
+import pandas as pd
+
+from mlflow import MlflowClient
+
+from mlflow_utils import (
+    configure_mlflow,
+    set_run_tags,
+    log_metrics,
+    log_artifact,
+)
+
+from evaluation import (
+    evaluate_product,
+    add_quality_labels,
+)
+
+from promotion_utils import (
+    calculate_composite_score,
+    prepare_promotion_metadata,
+)
+
+from mlflow_pipeline import get_incumbent_champion_score
+
+Then:
+
+@pytest.mark.integration
+def test_evaluation_and_promotion_mlflow(
+    mlflow_server,
+    evaluation_input,
+    tmp_path,
+):
+    """
+    Verifies evaluation, composite scoring, promotion,
+    and MLflow persistence using a real MLflow server.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Configure MLflow
+    # ---------------------------------------------------------
+
+    mlflow_config = configure_mlflow(
+        use_unity_catalog=False,
+        uc_catalog=None,
+        uc_schema=None,
+        base_experiment_name="integration_test",
+        product_name="summarization",
+        experiment_root_directory="/tmp",
+    )
+
+    assert mlflow_config["use_unity_catalog"] is False
+
+    client = MlflowClient()
+
+    # ---------------------------------------------------------
+    # 2. Create parent MLflow run
+    # ---------------------------------------------------------
+
+    with mlflow.start_run(run_name="summarization_integration"):
+
+        parent_run_id = mlflow.active_run().info.run_id
+
+        set_run_tags(
+            run_type="inference",
+            capability="abstractive summarization",
+            dataset_version="integration_test",
+            git_sha="testing git",
+        )
+
+        # -----------------------------------------------------
+        # 3. Create registered model(s)
+        # -----------------------------------------------------
+
+        registered_models = []
+
+        # These should correspond to models actually available
+        # in your integration-test setup.
+        for model_name in evaluation_input["registered_models"]:
+
+            registered_models.append(
+                {
+                    "model_name": model_name,
+                    "registered_name": model_name,
+                    "version": evaluation_input["model_versions"][
+                        model_name
+                    ],
+                }
+            )
+
+        # -----------------------------------------------------
+        # 4. Evaluation child run
+        # -----------------------------------------------------
+
+        with mlflow.start_run(
+            run_name="Evaluation",
+            nested=True,
+        ):
+
+            evaluation_run_id = (
+                mlflow.active_run().info.run_id
+            )
+
+            set_run_tags(
+                run_type="evaluation",
+                capability=(
+                    "abstractive summarization evaluation"
+                ),
+                dataset_version="integration_test",
+                git_sha="testing git",
+            )
+
+            # Link evaluation run to parent
+            mlflow.set_tag(
+                "evaluation_run_id",
+                evaluation_run_id,
+            )
+
+            # -------------------------------------------------
+            # 5. Actual evaluation
+            # -------------------------------------------------
+
+            eval_results = evaluate_product(
+                evaluation_input["data"]
+            )
+
+            assert eval_results is not None
+            assert not eval_results.empty
+
+            # -------------------------------------------------
+            # 6. Quality labels
+            # -------------------------------------------------
+
+            eval_labels_df = add_quality_labels(
+                eval_results
+            )
+
+            assert eval_labels_df is not None
+            assert not eval_labels_df.empty
+
+            # -------------------------------------------------
+            # 7. Composite score
+            # -------------------------------------------------
+
+            eval_df_composite = calculate_composite_score(
+                eval_labels_df
+            )
+
+            assert eval_df_composite is not None
+            assert not eval_df_composite.empty
+
+            assert "composite_score" in (
+                eval_df_composite.columns
+            )
+
+            assert (
+                pd.api.types.is_numeric_dtype(
+                    eval_df_composite["composite_score"]
+                )
+            )
+
+            # -------------------------------------------------
+            # 8. Get incumbent champion
+            # -------------------------------------------------
+
+            incumbent_score = get_incumbent_champion_score(
+                client,
+                [
+                    model["registered_name"]
+                    for model in registered_models
+                ],
+            )
+
+            # For a first clean integration test,
+            # there may be no incumbent.
+            assert (
+                incumbent_score is None
+                or isinstance(incumbent_score, float)
+            )
+
+            # -------------------------------------------------
+            # 9. Promotion decision
+            # -------------------------------------------------
+
+            promotion_info = prepare_promotion_metadata(
+                eval_df_composite,
+                incumbent_champion_score=incumbent_score,
+            )
+
+            assert promotion_info is not None
+
+            assert "champion" in promotion_info
+            assert "challenger" in promotion_info
+            assert "champion_score" in promotion_info
+            assert "challenger_score" in promotion_info
+            assert "aliases" in promotion_info
+            assert "promotion_status" in promotion_info
+
+            # -------------------------------------------------
+            # 10. Log evaluation metrics
+            # -------------------------------------------------
+
+            metric_row = (
+                eval_df_composite
+                .iloc[0]
+                .to_dict()
+            )
+
+            metrics = {}
+
+            for key, value in metric_row.items():
+
+                try:
+                    metrics[key] = float(value)
+
+                except (ValueError, TypeError):
+                    continue
+
+            if metrics:
+                log_metrics(metrics)
+
+            # -------------------------------------------------
+            # 11. Log promotion information
+            # -------------------------------------------------
+
+            if promotion_info["champion"] is not None:
+
+                mlflow.set_tag(
+                    "champion_model",
+                    promotion_info["champion"],
+                )
+
+            if promotion_info["champion_score"] is not None:
+
+                mlflow.log_metric(
+                    "champion_composite_score",
+                    promotion_info["champion_score"],
+                )
+
+            if promotion_info["challenger"] is not None:
+
+                mlflow.set_tag(
+                    "challenger_model",
+                    promotion_info["challenger"],
+                )
+
+            if promotion_info["challenger_score"] is not None:
+
+                mlflow.log_metric(
+                    "challenger_composite_score",
+                    promotion_info["challenger_score"],
+                )
+
+            mlflow.set_tag(
+                "promotion_status",
+                promotion_info["promotion_status"],
+            )
+
+            # -------------------------------------------------
+            # 12. Evaluation status
+            # -------------------------------------------------
+
+            mlflow.set_tag(
+                "evaluation_status",
+                "complete",
+            )
+
+            # -------------------------------------------------
+            # 13. Verify evaluation run while still active
+            # -------------------------------------------------
+
+            evaluation_run = client.get_run(
+                evaluation_run_id
+            )
+
+            assert evaluation_run.data.tags[
+                "run_type"
+            ] == "evaluation"
+
+            assert evaluation_run.data.tags[
+                "evaluation_status"
+            ] == "complete"
+
+            assert (
+                evaluation_run.data.tags[
+                    "dataset_version"
+                ]
+                == "integration_test"
+            )
+
+            assert len(evaluation_run.data.metrics) > 0
+
+            # -------------------------------------------------
+            # 14. Verify promotion persistence
+            # -------------------------------------------------
+
+            stored_promotion_status = (
+                evaluation_run.data.tags.get(
+                    "promotion_status"
+                )
+            )
+
+            assert stored_promotion_status == (
+                promotion_info["promotion_status"]
+            )
+5. But there is one important change
+
+I would not stop there.
+
+Your production process also links the evaluation back to each registered model version.
+
+Your code does:
+
+client.set_model_version_tag(
+    name=registered_name,
+    version=version,
+    key="evaluation_run_id",
+    value=child_run_id,
+)
+
+and:
+
+client.set_model_version_tag(
+    name=registered_name,
+    version=version,
+    key="composite_score",
+    value=str(composite_score),
+)
+
+and potentially:
+
+client.set_model_version_tag(
+    name=registered_name,
+    version=version,
+    key="promotion_role",
+    value=promotion_role,
+)
+
+This is exactly the part I would verify in the integration test.
+
+Add this:
+
+            # -------------------------------------------------
+            # 15. Verify model-version metadata
+            # -------------------------------------------------
+
+            for registered_model in registered_models:
+
+                registered_name = (
+                    registered_model["registered_name"]
+                )
+
+                version = registered_model["version"]
+
+                model_version = client.get_model_version(
+                    name=registered_name,
+                    version=version,
+                )
+
+                tags = model_version.tags
+
+                assert tags["evaluation_run_id"] == (
+                    evaluation_run_id
+                )
+
+                assert "composite_score" in tags
+
+                assert float(
+                    tags["composite_score"]
+                ) >= 0.0
+
+                if (
+                    registered_model["model_name"]
+                    in promotion_info["aliases"]
+                ):
+                    assert tags["promotion_role"] == (
+                        promotion_info["aliases"][
+                            registered_model["model_name"]
+                        ]
+                    )
+6. Verify the evaluation artifact
+
+Your production code also saves the evaluation output and logs it under:
+
+eval_output/
+
+Your code does:
+
+eval_out_file = save_eval_metric(
+    eval_df_composite,
+    PRODUCT_NAME,
+)
+
+log_artifact(
+    eval_out_file,
+    artifact_path="eval_output",
+)
+
+and then sets:
+
+evaluation_status = complete
+
+So add:
+
+            # -------------------------------------------------
+            # 16. Verify evaluation artifact
+            # -------------------------------------------------
+
+            artifacts = client.list_artifacts(
+                evaluation_run_id,
+                path="eval_output",
+            )
+
+            assert artifacts
+
+This proves the evaluation output was actually persisted to MLflow, rather than simply existing as a pandas DataFrame in memory.
+
+7. One thing I would NOT do
+
+I would not mock:
+
+MlflowClient()
+mlflow.start_run()
+mlflow.log_metric()
+mlflow.set_tag()
+client.set_model_version_tag()
+client.get_run()
+client.get_model_version()
+
+because then you are only testing that your code called MLflow.
+
+For this test, you want:
+
+                    REAL
+                     ↓
+              MLflow Server
+                     ↓
+              mlflow_summ.db
+                     ↓
+              MlflowClient
+                     ↓
+          retrieve what was saved
+
+That's what makes it an integration test.
+
+8. What should be mocked, if anything?
+
+Only external/expensive components that are not the integration boundary.
+
+For example, if running evaluate_product() requires an expensive external LLM/API call, you can provide deterministic evaluation input or a lightweight test model.
+
+But don't mock the MLflow layer.
+
+Your evaluation chain itself should remain:
+
+eval_results = evaluate_product(...)
+eval_labels_df = add_quality_labels(eval_results)
+eval_df_composite = calculate_composite_score(eval_labels_df)
+
+incumbent_score = get_incumbent_champion_score(
+    client,
+    registered_names,
+)
+
+promotion_info = prepare_promotion_metadata(
+    eval_df_composite,
+    incumbent_champion_score=incumbent_score,
+)
+
+That is the actual process in your pipeline.
+
+9. What your test fixtures need
+
+The only thing I cannot safely invent is the exact shape of your evaluate_product() input, because the snippet you've provided shows the call but not its complete function signature.
+
+So your test fixture should ultimately provide something like:
+
+@pytest.fixture
+def evaluation_input():
+    return {
+        "data": YOUR_ACTUAL_EVALUATION_DATA,
+        "registered_models": [
+            "model_1",
+            "model_2",
+        ],
+        "model_versions": {
+            "model_1": "1",
+            "model_2": "1",
+        },
+    }
+
+But don't copy that blindly until we use the actual evaluate_product() signature and the actual registered-model setup from your project.
+
+The final evaluation integration test should therefore prove
+Integration	Verified?
+Real MLflow server	✅
+mlflow_summ.db backend	✅
+configure_mlflow()	✅
+Parent MLflow run	✅
+Evaluation child run	✅
+evaluate_product()	✅
+add_quality_labels()	✅
+calculate_composite_score()	✅
+get_incumbent_champion_score()	✅
+prepare_promotion_metadata()	✅
+Evaluation metrics persisted	✅
+Promotion tags persisted	✅
+Evaluation status persisted	✅
+Evaluation artifact persisted	✅
+Model-version evaluation tag	✅
+Model-version composite score	✅
+Model-version promotion role	✅
+Retrieval through MlflowClient	✅
+
+This is the right integration-test scope for your evaluation + promotion flow, rather than duplicating the production logic or mocking MLflow.
+
+
+########
+
+Once you have the end-to-end evaluation/promotion test, the next useful MLflow integration test should specifically verify that your metadata is really persisted to the MLflow server and can be retrieved.
+
+I would make this a separate test rather than making the evaluation test enormous.
+
+Recommended next test
+
+test_mlflow_run_logs_inputs_parameters_and_metrics()
+
+It should verify:
+
+configure_mlflow() configures the real MLflow server.
+Start a real MLflow run.
+Log input dataset information.
+Log parameters.
+Log metrics.
+Log tags.
+Retrieve the run using MlflowClient.
+Verify everything persisted correctly.
+
+Your mlflow_utils.py already has helpers for parameters and metrics, including log_parameters() and log_metrics().
+
+Test
+import mlflow
+import pytest
+
+from mlflow import MlflowClient
+
+from mlflow_utils import (
+    configure_mlflow,
+    set_run_tags,
+    log_parameters,
+    log_metrics,
+    log_input_dataset,
+)
+
+
+@pytest.mark.integration
+def test_mlflow_run_logs_inputs_parameters_and_metrics(
+    mlflow_server,
+):
+    """Verify MLflow persists inputs, parameters, metrics, and tags."""
+
+    # ---------------------------------------------------------
+    # Configure MLflow
+    # ---------------------------------------------------------
+
+    mlflow_config = configure_mlflow(
+        use_unity_catalog=False,
+        uc_catalog=None,
+        uc_schema=None,
+        base_experiment_name="integration_test",
+        product_name="summarization",
+        experiment_root_directory="/tmp",
+    )
+
+    client = MlflowClient()
+
+    # ---------------------------------------------------------
+    # Start real MLflow run
+    # ---------------------------------------------------------
+
+    with mlflow.start_run(
+        run_name="metadata_logging_test"
+    ):
+
+        run_id = mlflow.active_run().info.run_id
+
+        # -----------------------------------------------------
+        # Log tags
+        # -----------------------------------------------------
+
+        set_run_tags(
+            run_type="evaluation",
+            capability="abstractive summarization",
+            dataset_version="test_v1",
+            git_sha="testing_git",
+        )
+
+        # -----------------------------------------------------
+        # Log input
+        # -----------------------------------------------------
+
+        log_input_dataset(
+            "tests/data/evaluation_input.xlsx"
+        )
+
+        # -----------------------------------------------------
+        # Log parameters
+        # -----------------------------------------------------
+
+        parameters = {
+            "model_name": "test_model",
+            "max_tokens": 3000,
+            "temperature": 0.0,
+        }
+
+        log_parameters(parameters)
+
+        # -----------------------------------------------------
+        # Log metrics
+        # -----------------------------------------------------
+
+        metrics = {
+            "rougeL": 0.82,
+            "bert_f1": 0.88,
+            "meteor": 0.76,
+            "factual_consistency": 0.91,
+            "composite_score": 0.85,
+        }
+
+        log_metrics(metrics)
+
+    # =========================================================
+    # Retrieve run from REAL MLflow server
+    # =========================================================
+
+    run = client.get_run(run_id)
+
+    # ---------------------------------------------------------
+    # Verify tags
+    # ---------------------------------------------------------
+
+    tags = run.data.tags
+
+    assert tags["run_type"] == "evaluation"
+
+    assert tags["capability"] == (
+        "abstractive summarization"
+    )
+
+    assert tags["dataset_version"] == "test_v1"
+
+    assert tags["git_sha"] == "testing_git"
+
+    # ---------------------------------------------------------
+    # Verify parameters
+    # ---------------------------------------------------------
+
+    params = run.data.params
+
+    assert params["model_name"] == "test_model"
+    assert params["max_tokens"] == "3000"
+    assert params["temperature"] == "0.0"
+
+    # ---------------------------------------------------------
+    # Verify metrics
+    # ---------------------------------------------------------
+
+    logged_metrics = run.data.metrics
+
+    assert logged_metrics["rougeL"] == pytest.approx(0.82)
+    assert logged_metrics["bert_f1"] == pytest.approx(0.88)
+    assert logged_metrics["meteor"] == pytest.approx(0.76)
+    assert logged_metrics["factual_consistency"] == pytest.approx(0.91)
+    assert logged_metrics["composite_score"] == pytest.approx(0.85)
+One correction regarding "inputs"
+
+Your current log_input_dataset() helper actually logs the dataset path as a parameter:
+
+mlflow.log_param(
+    "input_dataset",
+    dataset_path,
+)
+
+So in this test you should also explicitly verify:
+
+assert params["input_dataset"] == (
+    "tests/data/evaluation_input.xlsx"
+)
+
+That makes the test:
+
+input → parameter → metric → tag → MLflow server → retrieve → verify
+
+I would have these MLflow integration tests
+
+I think your test suite should now be roughly:
+
+Test	What it proves
+test_mlflow_run_logs_inputs_parameters_and_metrics	Metadata persistence
+test_model_logging_and_registration	Model logging → validation → registration → model-version metadata
+test_evaluation_and_promotion_mlflow	Evaluation → composite score → champion/challenger → promotion
+test_model_version_evaluation_linkage	Evaluation run linked to registered model version
+test_mlflow_logged_model_can_be_loaded_and_predicted	Logged model → load → prediction
+
+So yes, your proposed next step is exactly right: test the basic MLflow logging contract separately before relying on it inside the larger evaluation/promotion integration test.
