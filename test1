@@ -125,3 +125,21 @@ def test_summarization_prediction_mlflow_sqlite(tmp_path, monkeypatch):
 
             assert result is not None
             assert len(result) == len(sqlite_input)
+
+
+####
+
+@pytest.mark.integration
+def test_mlflow_server_fixture(mlflow_server):
+    assert mlflow_server is not None
+    assert mlflow_server.startswith("http://")
+
+    client = MlflowClient(tracking_uri=mlflow_server)
+
+    experiment = client.create_experiment(
+        "fixture-test"
+    )
+
+    assert experiment is not None
+
+pytest tests/integration/test_mlflow.py::test_mlflow_server_fixture -v
