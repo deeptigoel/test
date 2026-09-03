@@ -1,33 +1,127 @@
-def test_mlflow_run_logs_metadata(mock_mlflow):
-    """Verify MLflow run metadata is logged."""
+@pytest.fixture
+def mlflow_server(tmp_path):
+    db_path = tmp_path / "mlflow_summ.db"
+    artifact_path = tmp_path / "artifacts"
 
-    from mlflow_utils import (
-        setup_experiment,
-        set_run_tags,
-        log_parameters,
-        log_metrics,
+    # Start MLflow server using SQLite backend
+    port = get_free_port()
+
+    process = subprocess.Popen([
+        sys.executable, "-m", "mlflow", "server",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--backend-store-uri", f"sqlite:///{db_path}",
+        "--default-artifact-root", str(artifact_path),
+    ])
+
+    tracking_uri = f"http://127.0.0.1:{port}"
+
+    wait_for_mlflow(tracking_uri)
+
+    yield tracking_uri
+
+    process.terminate()
+    process.wait()
+
+
+
+##@pytest.mark.integration
+def test_summarization_prediction_mlflow_sqlite(tmp_path, monkeypatch):
+    """
+    Verifies summarization prediction → SQLite storage → MLflow logging →
+    model retrieval → schema-enforced prediction.
+    """
+
+    # Start/configure real MLflow server
+    configure_mlflow()
+
+    combined_text = (
+        "This is a sample document used to validate the summarization pipeline."
     )
 
-    setup_experiment("test_experiment")
-    set_run_tags(
-        run_type="inference",
-        capability="summarization",
-        dataset_version="v1",
-    )
-    log_parameters({"model_name": "test_model"})
-    log_metrics({"composite_score": 0.85})
+    # Actual production pipeline
+    summary_results, models = run_pipeline(combined_text)
 
-    mock_mlflow.set_experiment.assert_called_once_with(
-        "test_experiment"
-    )
-    mock_mlflow.set_tags.assert_called_once_with({
-        "run_type": "inference",
-        "capability": "summarization",
-        "dataset_version": "v1",
-    })
-    mock_mlflow.log_params.assert_called_once_with({
-        "model_name": "test_model"
-    })
-    mock_mlflow.log_metrics.assert_called_once_with({
-        "composite_score": 0.85
-    })
+    # Store prediction results locally
+    db_path = tmp_path / "mlflow_summ.db"
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_text TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                prediction TEXT NOT NULL
+            )
+            """
+        )
+
+        for model_name, prediction in summary_results.items():
+            conn.execute(
+                """
+                INSERT INTO predictions
+                (input_text, model_name, prediction)
+                VALUES (?, ?, ?)
+                """,
+                (combined_text, model_name, prediction),
+            )
+
+        conn.commit()
+
+        stored_df = pd.read_sql(
+            "SELECT input_text, model_name, prediction FROM predictions",
+            conn,
+        )
+
+    assert not stored_df.empty
+    assert {"input_text", "model_name", "prediction"} <= set(stored_df.columns)
+
+    # Real MLflow run
+    with mlflow.start_run() as run:
+        run_id = run.info.run_id
+
+        mlflow.log_param("input_source", "sqlite")
+        mlflow.log_metric("prediction_count", len(stored_df))
+
+        for model_name, model_pipeline in models.items():
+
+            model_input = pd.DataFrame(
+                {"text": [combined_text]}
+            )
+
+            raw_prediction = model_pipeline(combined_text)
+
+            model_output = pd.DataFrame(
+                {
+                    "prediction": [
+                        raw_prediction[0]["summary_text"]
+                    ]
+                }
+            )
+
+            signature = infer_signature(
+                model_input,
+                model_output,
+            )
+
+            assert log_transformer_model(
+                model_name=model_name,
+                model_pipeline=model_pipeline,
+                signature=signature,
+            )
+
+            model_uri = f"runs:/{run_id}/{model_name}"
+
+            loaded_model = mlflow.pyfunc.load_model(model_uri)
+
+            sqlite_input = stored_df[
+                stored_df["model_name"] == model_name
+            ][["input_text"]].rename(
+                columns={"input_text": "text"}
+            )
+
+            result = loaded_model.predict(sqlite_input)
+
+            assert result is not None
+            assert len(result) == len(sqlite_input)
