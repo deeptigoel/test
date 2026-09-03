@@ -1,27 +1,79 @@
+import os
+import socket
+import subprocess
+import sys
+import time
+
+import mlflow
+import pytest
+
+
+def _get_free_port():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
 @pytest.fixture
 def mlflow_server(tmp_path):
-    db_path = tmp_path / "mlflow_summ.db"
-    artifact_path = tmp_path / "artifacts"
+    """
+    Start a temporary MLflow server backed by SQLite.
+    """
 
-    # Start MLflow server using SQLite backend
-    port = get_free_port()
+    port = _get_free_port()
 
-    process = subprocess.Popen([
-        sys.executable, "-m", "mlflow", "server",
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--backend-store-uri", f"sqlite:///{db_path}",
-        "--default-artifact-root", str(artifact_path),
-    ])
+    backend_db = tmp_path / "mlflow.db"
+    artifact_root = tmp_path / "artifacts"
+
+    artifact_root.mkdir()
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mlflow",
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--backend-store-uri",
+            f"sqlite:///{backend_db}",
+            "--default-artifact-root",
+            str(artifact_root),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
     tracking_uri = f"http://127.0.0.1:{port}"
 
-    wait_for_mlflow(tracking_uri)
+    for _ in range(30):
+        try:
+            response = __import__("requests").get(
+                f"{tracking_uri}/health",
+                timeout=1,
+            )
+
+            if response.status_code == 200:
+                break
+
+        except Exception:
+            time.sleep(1)
+
+    else:
+        process.terminate()
+        raise RuntimeError("MLflow server failed to start.")
+
+    mlflow.set_tracking_uri(tracking_uri)
 
     yield tracking_uri
 
     process.terminate()
-    process.wait()
+    process.wait(timeout=10)
 
 
 
