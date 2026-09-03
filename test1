@@ -1,103 +1,58 @@
-import os
-import socket
-import subprocess
-import sys
-import time
+The biggest issue is that your current log_transformer_model() does not accept signature, so this from the earlier test:
 
-import mlflow
-import pytest
+log_transformer_model(
+    model_name=model_name,
+    model_pipeline=model_pipeline,
+    signature=signature,
+)
 
+will fail with:
 
-def _get_free_port():
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+TypeError: log_transformer_model() got an unexpected keyword argument 'signature'
 
+Also, configure_mlflow() requires 6 arguments, so you cannot simply call:
 
-@pytest.fixture
-def mlflow_server(tmp_path):
-    """
-    Start a temporary MLflow server backed by SQLite.
-    """
-
-    port = _get_free_port()
-
-    backend_db = tmp_path / "mlflow.db"
-    artifact_root = tmp_path / "artifacts"
-
-    artifact_root.mkdir()
-
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "mlflow",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--backend-store-uri",
-            f"sqlite:///{backend_db}",
-            "--default-artifact-root",
-            str(artifact_root),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    tracking_uri = f"http://127.0.0.1:{port}"
-
-    for _ in range(30):
-        try:
-            response = __import__("requests").get(
-                f"{tracking_uri}/health",
-                timeout=1,
-            )
-
-            if response.status_code == 200:
-                break
-
-        except Exception:
-            time.sleep(1)
-
-    else:
-        process.terminate()
-        raise RuntimeError("MLflow server failed to start.")
-
-    mlflow.set_tracking_uri(tracking_uri)
-
-    yield tracking_uri
-
-    process.terminate()
-    process.wait(timeout=10)
-
-
-
-##@pytest.mark.integration
-def test_summarization_prediction_mlflow_sqlite(tmp_path, monkeypatch):
+configure_mlflow()
+For your current code, use this test
+@pytest.mark.integration
+def test_summarization_prediction_mlflow_sqlite(
+    tmp_path,
+    mlflow_server,
+):
     """
     Verifies summarization prediction → SQLite storage → MLflow logging →
-    model retrieval → schema-enforced prediction.
+    model retrieval → prediction.
     """
 
-    # Start/configure real MLflow server
-    configure_mlflow()
+    # Point MLflow to the temporary test server
+    mlflow.set_tracking_uri(mlflow_server)
 
-    combined_text = (
-        "This is a sample document used to validate the summarization pipeline."
+    # Configure registry and experiment
+    configure_mlflow(
+        use_unity_catalog=False,
+        uc_catalog=None,
+        uc_schema=None,
+        base_experiment_name="SummarizationIntegrationTest",
+        product_name="TestProduct",
+        experiment_root_directory="/",
     )
 
-    # Actual production pipeline
+    combined_text = (
+        "This is a sample document used to validate "
+        "the summarization pipeline."
+    )
+
+    # Run actual production pipeline
     summary_results, models = run_pipeline(combined_text)
 
-    # Store prediction results locally
+    # ---------------------------------------------------------
+    # Store prediction results in SQLite
+    # ---------------------------------------------------------
+
     db_path = tmp_path / "mlflow_summ.db"
 
     with sqlite3.connect(db_path) as conn:
+
         conn.execute(
             """
             CREATE TABLE predictions (
@@ -110,31 +65,59 @@ def test_summarization_prediction_mlflow_sqlite(tmp_path, monkeypatch):
         )
 
         for model_name, prediction in summary_results.items():
+
             conn.execute(
                 """
                 INSERT INTO predictions
                 (input_text, model_name, prediction)
                 VALUES (?, ?, ?)
                 """,
-                (combined_text, model_name, prediction),
+                (
+                    combined_text,
+                    model_name,
+                    prediction,
+                ),
             )
 
         conn.commit()
 
         stored_df = pd.read_sql(
-            "SELECT input_text, model_name, prediction FROM predictions",
+            """
+            SELECT input_text, model_name, prediction
+            FROM predictions
+            """,
             conn,
         )
 
     assert not stored_df.empty
-    assert {"input_text", "model_name", "prediction"} <= set(stored_df.columns)
 
-    # Real MLflow run
+    assert {
+        "input_text",
+        "model_name",
+        "prediction",
+    }.issubset(stored_df.columns)
+
+    # ---------------------------------------------------------
+    # MLflow run
+    # ---------------------------------------------------------
+
     with mlflow.start_run() as run:
+
         run_id = run.info.run_id
 
-        mlflow.log_param("input_source", "sqlite")
-        mlflow.log_metric("prediction_count", len(stored_df))
+        mlflow.log_param(
+            "input_source",
+            "sqlite",
+        )
+
+        mlflow.log_metric(
+            "prediction_count",
+            len(stored_df),
+        )
+
+        # -----------------------------------------------------
+        # Log and retrieve each summarization model
+        # -----------------------------------------------------
 
         for model_name, model_pipeline in models.items():
 
@@ -142,7 +125,9 @@ def test_summarization_prediction_mlflow_sqlite(tmp_path, monkeypatch):
                 {"text": [combined_text]}
             )
 
-            raw_prediction = model_pipeline(combined_text)
+            raw_prediction = model_pipeline(
+                combined_text
+            )
 
             model_output = pd.DataFrame(
                 {
@@ -157,41 +142,103 @@ def test_summarization_prediction_mlflow_sqlite(tmp_path, monkeypatch):
                 model_output,
             )
 
+            # Current function does not accept signature
             assert log_transformer_model(
                 model_name=model_name,
                 model_pipeline=model_pipeline,
-                signature=signature,
             )
 
-            model_uri = f"runs:/{run_id}/{model_name}"
+            model_uri = (
+                f"runs:/{run_id}/{model_name}"
+            )
 
-            loaded_model = mlflow.pyfunc.load_model(model_uri)
+            loaded_model = mlflow.pyfunc.load_model(
+                model_uri
+            )
+
+            # -------------------------------------------------
+            # Read input from SQLite
+            # -------------------------------------------------
 
             sqlite_input = stored_df[
                 stored_df["model_name"] == model_name
             ][["input_text"]].rename(
-                columns={"input_text": "text"}
+                columns={
+                    "input_text": "text"
+                }
             )
 
-            result = loaded_model.predict(sqlite_input)
+            # -------------------------------------------------
+            # Schema-enforced prediction
+            # -------------------------------------------------
+
+            result = loaded_model.predict(
+                sqlite_input
+            )
 
             assert result is not None
             assert len(result) == len(sqlite_input)
+One important correction
 
+Your configure_mlflow() does this:
 
-####
+mlflow.set_registry_uri(MLFLOW_REGISTRY_URI)
 
-@pytest.mark.integration
-def test_mlflow_server_fixture(mlflow_server):
-    assert mlflow_server is not None
-    assert mlflow_server.startswith("http://")
+when Unity Catalog is disabled.
 
-    client = MlflowClient(tracking_uri=mlflow_server)
+For this test, that means your registry URI is controlled by the constant in config.py, not necessarily the temporary MLflow server.
 
-    experiment = client.create_experiment(
-        "fixture-test"
-    )
+If MLFLOW_REGISTRY_URI is something like:
 
-    assert experiment is not None
+MLFLOW_REGISTRY_URI = "databricks"
 
-pytest tests/integration/test_mlflow.py::test_mlflow_server_fixture -v
+then your integration test could accidentally try to use Databricks.
+
+For a completely local integration test, I'd want:
+
+Tracking URI  → temporary MLflow server
+Registry URI  → same temporary MLflow server
+Backend       → temporary SQLite
+Artifacts     → temporary artifact directory
+
+So your test should ideally be able to configure both tracking and registry to the temporary server.
+
+I would make one small production-code improvement
+
+Change configure_mlflow() to optionally accept the tracking/registry URI:
+
+def configure_mlflow(
+    use_unity_catalog: bool,
+    uc_catalog: str | None,
+    uc_schema: str | None,
+    base_experiment_name: str,
+    product_name: str,
+    experiment_root_directory: str | None,
+    tracking_uri: str | None = None,
+    registry_uri: str | None = None,
+) -> dict[str, Any]:
+
+Then:
+
+if tracking_uri:
+    mlflow.set_tracking_uri(tracking_uri)
+
+if registry_uri:
+    mlflow.set_registry_uri(registry_uri)
+
+Your integration test can then do:
+
+configure_mlflow(
+    use_unity_catalog=False,
+    uc_catalog=None,
+    uc_schema=None,
+    base_experiment_name="SummarizationIntegrationTest",
+    product_name="TestProduct",
+    experiment_root_directory="/",
+    tracking_uri=mlflow_server,
+    registry_uri=mlflow_server,
+)
+
+That is much cleaner for your MLflow integration testing, because the test becomes completely isolated from your real Databricks/MLflow configuration.
+
+One other thing: your current log_transformer_model() doesn't actually use the signature you're calculating. If schema enforcement is one of the things you specifically want this integration test to verify, we should modify log_transformer_model() to accept and pass the signature to mlflow.transformers.log_model().
